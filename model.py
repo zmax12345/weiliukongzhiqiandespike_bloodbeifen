@@ -13,12 +13,18 @@ class SNN_CNN_Hybrid(nn.Module):
         max_velocity=2.0,
         accumulation_mode="total",
         decoder_norm=None,
+        use_beta_conditioning=False,
+        use_bounded_scatter=False,
+        scatter_scale=0.3,
     ):
         super().__init__()
         if accumulation_mode != "total":
             raise ValueError("Only accumulation_mode='total' is enabled in the clean SNN-CNN backbone.")
         self.accumulation_mode = accumulation_mode
         self.decoder_norm = decoder_norm
+        self.use_beta_conditioning = bool(use_beta_conditioning)
+        self.use_bounded_scatter = bool(use_bounded_scatter)
+        self.scatter_scale = float(scatter_scale)
         self.snn_encoder = SNNEncoder(in_channels=in_channels)
         self.decoder = SNNFeatureCNNDecoder(
             in_channels=(
@@ -30,6 +36,9 @@ class SNN_CNN_Hybrid(nn.Module):
             init_velocity=1.1,
             log_tau_center=-4.0,
             log_tau_scale=2.0,
+            use_beta_conditioning=self.use_beta_conditioning,
+            use_bounded_scatter=self.use_bounded_scatter,
+            scatter_scale=self.scatter_scale,
         )
 
     @staticmethod
@@ -78,6 +87,8 @@ class SNN_CNN_Hybrid(nn.Module):
         snn_input_scale_mode="sqrt",
         base_dt_us=20,
         env_maps=None,
+        log_beta_max=None,
+        beta_max=None,
     ):
         if base_total_steps % snn_bin_size != 0:
             raise ValueError("base_total_steps must be divisible by snn_bin_size.")
@@ -132,7 +143,18 @@ class SNN_CNN_Hybrid(nn.Module):
             raise RuntimeError(f"Expected {expected_snn_steps} SNN frames, processed {processed_snn_steps}.")
 
         feat_1, feat_2, feat_3 = (acc / float(processed_snn_steps) for acc in accum)
-        decoder_output = self.decoder((feat_1, feat_2, feat_3), patches_per_sample=patches_per_sample)
+        batch_size = dataloader_or_generator.batch_size
+        if log_beta_max is None:
+            log_beta_max = feat_1.new_zeros(batch_size)
+        if beta_max is None:
+            beta_max = feat_1.new_ones(batch_size)
+
+        decoder_output = self.decoder(
+            (feat_1, feat_2, feat_3),
+            patches_per_sample=patches_per_sample,
+            log_beta_max=log_beta_max,
+            beta_max=beta_max,
+        )
 
         return {
             **decoder_output,
@@ -156,4 +178,7 @@ class SNN_CNN_Hybrid(nn.Module):
             "snn_step_us": int(base_dt_us * snn_bin_size),
             "window_ms": int(base_total_steps * base_dt_us / 1000),
             "snn_input_scale_mode": snn_input_scale_mode,
+            "use_beta_conditioning": self.use_beta_conditioning,
+            "use_bounded_scatter": self.use_bounded_scatter,
+            "scatter_scale": self.scatter_scale,
         }
