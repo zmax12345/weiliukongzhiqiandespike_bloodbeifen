@@ -30,6 +30,17 @@ except ImportError:
 from dataset_robust import FlexibleBloodFlowDataset, sequence_sparse_collate
 from dense_block_manager import DenseBlockManager
 from model import SNN_CNN_Hybrid
+from train_cross import (
+    build_prediction_records,
+    compute_condition_velocity_metrics,
+    compute_sub_condition_velocity_metrics,
+    save_condition_velocity_metrics_csv,
+    save_sub_condition_velocity_metrics_csv,
+)
+
+
+SAVE_GLOBAL_PREDICTION_MAPS = True
+MAX_PREDICTION_MAP_PREVIEWS = 24
 
 
 def load_trusted_checkpoint(checkpoint_path, map_location):
@@ -37,6 +48,125 @@ def load_trusted_checkpoint(checkpoint_path, map_location):
         return torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(checkpoint_path, map_location=map_location)
+
+
+def unpack_eval_batch(batch):
+    if len(batch) == 14:
+        (
+            x_seq_sparse_data,
+            y_true,
+            d_values,
+            env_maps,
+            source_ids,
+            K_max,
+            beta_max,
+            log_beta_max,
+            condition,
+            sub_condition,
+            split_group,
+            quality,
+            phantom_flag,
+            metadata,
+        ) = batch
+    elif len(batch) == 13:
+        (
+            x_seq_sparse_data,
+            y_true,
+            d_values,
+            env_maps,
+            source_ids,
+            K_max,
+            beta_max,
+            log_beta_max,
+            condition,
+            sub_condition,
+            split_group,
+            quality,
+            phantom_flag,
+        ) = batch
+        metadata = None
+    elif len(batch) == 11:
+        (
+            x_seq_sparse_data,
+            y_true,
+            d_values,
+            env_maps,
+            source_ids,
+            K_max,
+            beta_max,
+            log_beta_max,
+            condition,
+            phantom_flag,
+            metadata,
+        ) = batch
+        batch_size = int(y_true.shape[0])
+        sub_condition = ["unknown"] * batch_size
+        split_group = ["train_val"] * batch_size
+        quality = ["legacy"] * batch_size
+    elif len(batch) == 10:
+        (
+            x_seq_sparse_data,
+            y_true,
+            d_values,
+            env_maps,
+            source_ids,
+            K_max,
+            beta_max,
+            log_beta_max,
+            condition,
+            phantom_flag,
+        ) = batch
+        metadata = None
+        batch_size = int(y_true.shape[0])
+        sub_condition = ["unknown"] * batch_size
+        split_group = ["train_val"] * batch_size
+        quality = ["legacy"] * batch_size
+    else:
+        x_seq_sparse_data, y_true, d_values, env_maps, source_ids = batch[:5]
+        batch_size = int(y_true.shape[0])
+        K_max = torch.ones(batch_size, dtype=torch.float32)
+        beta_max = torch.ones(batch_size, dtype=torch.float32)
+        log_beta_max = torch.zeros(batch_size, dtype=torch.float32)
+        condition = ["unknown"] * batch_size
+        sub_condition = ["unknown"] * batch_size
+        split_group = ["train_val"] * batch_size
+        quality = ["legacy"] * batch_size
+        phantom_flag = torch.zeros(batch_size, dtype=torch.float32)
+        metadata = batch[5] if len(batch) > 5 else None
+    return x_seq_sparse_data, y_true, d_values, env_maps, source_ids, K_max, beta_max, log_beta_max, condition, sub_condition, split_group, quality, phantom_flag, metadata
+
+
+def merge_checkpoint_kmax_config(test_data_config, checkpoint):
+    if not isinstance(checkpoint, dict):
+        return test_data_config
+    checkpoint_data_config = checkpoint.get("data_config", {})
+    candidate_maps = []
+    if isinstance(checkpoint_data_config, dict):
+        for value in checkpoint_data_config.values():
+            if isinstance(value, dict):
+                candidate_maps.append(value)
+        candidate_maps.append(checkpoint_data_config)
+    merged = {}
+    for path, config_value in test_data_config.items():
+        restored = None
+        for mapping in candidate_maps:
+            if path in mapping and isinstance(mapping[path], dict) and "K_max" in mapping[path]:
+                restored = mapping[path]
+                break
+        if restored is not None and not isinstance(config_value, dict):
+            merged[path] = {
+                "d_value": float(config_value),
+                "K_max": restored.get("K_max", 1.0),
+                "condition": restored.get("condition", "unknown"),
+                "sub_condition": restored.get("sub_condition", "unknown"),
+                "phantom_flag": restored.get("phantom_flag", -1),
+                "split_group": restored.get("split_group", "evaluate"),
+                "quality": restored.get("quality", "legacy"),
+                "use_for_training": restored.get("use_for_training", False),
+            }
+        else:
+            merged[path] = config_value
+    return merged
 
 
 def compute_scalar_metrics(v_true_list, v_pred_list):
@@ -285,6 +415,9 @@ def write_evaluation_report(report_path, run_info, eval_record):
         f"- patch_shape: `{run_info['patch_shape']}`",
         f"- max_eval_batches: `{run_info['max_eval_batches']}`",
         f"- max_velocity: `{run_info['max_velocity']}`",
+        f"- use_beta_conditioning: `{run_info.get('use_beta_conditioning', False)}`",
+        f"- use_bounded_scatter: `{run_info.get('use_bounded_scatter', False)}`",
+        f"- scatter_scale: `{run_info.get('scatter_scale', float('nan'))}`",
         "",
         "### Batch Limit Summary",
         "",
@@ -332,6 +465,19 @@ def write_evaluation_report(report_path, run_info, eval_record):
         lines.extend(
             [
                 "",
+                "### Beta/Scatter Diagnostics",
+                "",
+                f"- beta_eff_lt_beta_max: `{eval_record.get('beta_eff_lt_beta_max')}`",
+                f"- gamma_mean/std: `{eval_record.get('gamma_mean', float('nan')):.6f}` / `{eval_record.get('gamma_std', float('nan')):.6f}`",
+                f"- beta_eff_ratio_mean: `{eval_record.get('beta_eff_ratio_mean', float('nan')):.6f}`",
+                f"- scatter_delta_mean: `{eval_record.get('scatter_delta_mean', float('nan')):.6f}`",
+                f"- corr_gamma_velocity: `{eval_record.get('corr_gamma_velocity', float('nan')):.6f}`",
+                f"- corr_scatter_delta_velocity: `{eval_record.get('corr_scatter_delta_velocity', float('nan')):.6f}`",
+            ]
+        )
+        lines.extend(
+            [
+                "",
                 "### MAE By Velocity",
                 "",
                 "| Velocity | Samples | Pred Mean | Pred Std | Bias | MAE | RMSE | MAPE |",
@@ -347,15 +493,181 @@ def write_evaluation_report(report_path, run_info, eval_record):
     lines.extend(
         [
             "",
+            "## Global Prediction Maps",
+            "",
+            "- These maps render the sample-level global prediction back onto the ROI for quick visual inspection.",
+            "- They are not local velocity-field predictions; every valid pixel in a sample mask receives the same `v_final` value.",
+            f"- Prediction map dir: `{run_info.get('prediction_map_outputs', {}).get('prediction_map_dir', '')}`",
+            f"- Mean prediction map PNG: `{run_info.get('prediction_map_outputs', {}).get('mean_prediction_map_png', '')}`",
+            f"- Mean prediction map NPY: `{run_info.get('prediction_map_outputs', {}).get('mean_prediction_map_npy', '')}`",
+            f"- Sample-count map NPY: `{run_info.get('prediction_map_outputs', {}).get('sample_count_map_npy', '')}`",
+            f"- Manifest CSV: `{run_info.get('prediction_map_outputs', {}).get('manifest_csv', '')}`",
+            f"- Sample map files: `{run_info.get('prediction_map_outputs', {}).get('num_sample_maps', 0)}`",
+            f"- Preview PNG files: `{run_info.get('prediction_map_outputs', {}).get('num_preview_png', 0)}`",
+            "",
             "## Notes",
             "",
-            "- Final prediction is `d_values / tau_pred` from the sample-level tau head.",
-            "- `v_pred` is auxiliary only; no beta, raw direct head, fusion head, or patch tau map is used.",
+            "- Final prediction is `d_values / tau_pred`; `tau_pred` denotes `tau_eff` when bounded scatter is enabled.",
+            "- `v_pred` is auxiliary only.",
+            "- beta_eff is constrained as sigmoid(raw_gamma) * beta_max.",
             "",
         ]
     )
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+def _safe_filename(text):
+    text = str(text or "unknown")
+    keep = []
+    for char in text:
+        if char.isalnum() or char in {"-", "_", "."}:
+            keep.append(char)
+        else:
+            keep.append("_")
+    return "".join(keep).strip("_") or "unknown"
+
+
+def _source_mask_for_prediction_map(dataset, source_path, spatial_shape):
+    source_masks = getattr(dataset, "source_channel_masks", {})
+    mask = source_masks.get(source_path)
+    if mask is None:
+        return np.ones(spatial_shape, dtype=bool)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != tuple(spatial_shape):
+        raise ValueError(
+            f"channel mask shape mismatch while rendering prediction map for source `{source_path}`: "
+            f"expected {spatial_shape}, got {mask.shape}."
+        )
+    return mask
+
+
+def save_prediction_map_png(path, pred_map, title, vmin=None, vmax=None):
+    plt.figure(figsize=(14, 3.2))
+    masked = np.ma.masked_invalid(pred_map)
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(alpha=0.0)
+    im = plt.imshow(masked, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", origin="upper")
+    plt.colorbar(im, label="Predicted velocity (mm/s)")
+    plt.xlabel("Local col in ROI")
+    plt.ylabel("Local row in ROI")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path, dpi=220)
+    plt.close()
+
+
+def save_global_prediction_maps(
+    output_dir,
+    dataset,
+    metadata_list,
+    pred_values,
+    true_values,
+    condition_values,
+    sub_condition_values,
+    spatial_shape,
+    max_preview=24,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    pred_values = np.asarray(pred_values, dtype=np.float64)
+    true_values = np.asarray(true_values, dtype=np.float64)
+    accum = np.zeros(spatial_shape, dtype=np.float64)
+    counts = np.zeros(spatial_shape, dtype=np.float64)
+    manifest_rows = []
+
+    finite_preds = pred_values[np.isfinite(pred_values)]
+    vmin = float(np.nanpercentile(finite_preds, 5)) if finite_preds.size else None
+    vmax = float(np.nanpercentile(finite_preds, 95)) if finite_preds.size else None
+    if vmin is not None and vmax is not None and abs(vmax - vmin) < 1e-12:
+        vmin = float(finite_preds.min())
+        vmax = float(finite_preds.max() + 1e-6)
+
+    for idx, meta in enumerate(metadata_list):
+        source_path = meta.get("source_path", "")
+        pred_value = float(pred_values[idx])
+        source_mask = _source_mask_for_prediction_map(dataset, source_path, spatial_shape)
+        if np.isfinite(pred_value):
+            accum[source_mask] += pred_value
+            counts[source_mask] += 1.0
+
+        pred_map = np.full(spatial_shape, np.nan, dtype=np.float32)
+        if np.isfinite(pred_value):
+            pred_map[source_mask] = pred_value
+
+        source_stem = _safe_filename(os.path.basename(str(source_path).rstrip("/\\")) or source_path)
+        file_stem = _safe_filename(os.path.splitext(os.path.basename(str(meta.get("file_path", ""))))[0])
+        map_name = f"sample_{idx:04d}_{source_stem}_{file_stem}_global_prediction_map"
+        npy_path = os.path.join(output_dir, f"{map_name}.npy")
+        png_path = os.path.join(output_dir, f"{map_name}.png")
+        np.save(npy_path, pred_map)
+        if idx < max_preview:
+            title = (
+                "Global prediction rendered as ROI map | "
+                f"pred={pred_value:.4f} mm/s, label={true_values[idx]:.4f}"
+            )
+            save_prediction_map_png(png_path, pred_map, title, vmin=vmin, vmax=vmax)
+        else:
+            png_path = ""
+
+        manifest_rows.append(
+            {
+                "idx": idx,
+                "source_path": source_path,
+                "file_path": meta.get("file_path", ""),
+                "condition": condition_values[idx] if idx < len(condition_values) else "unknown",
+                "sub_condition": sub_condition_values[idx] if idx < len(sub_condition_values) else "unknown",
+                "true_velocity": float(true_values[idx]) if idx < len(true_values) else float("nan"),
+                "pred_velocity": pred_value,
+                "mask_area_pixels": int(source_mask.sum()),
+                "prediction_map_npy": npy_path,
+                "prediction_map_png": png_path,
+            }
+        )
+
+    mean_map = np.full(spatial_shape, np.nan, dtype=np.float32)
+    valid = counts > 0
+    mean_map[valid] = (accum[valid] / counts[valid]).astype(np.float32)
+    mean_npy_path = os.path.join(output_dir, "evaluate_global_prediction_map_mean.npy")
+    mean_png_path = os.path.join(output_dir, "evaluate_global_prediction_map_mean.png")
+    count_npy_path = os.path.join(output_dir, "evaluate_global_prediction_map_sample_count.npy")
+    manifest_path = os.path.join(output_dir, "evaluate_global_prediction_map_manifest.csv")
+    np.save(mean_npy_path, mean_map)
+    np.save(count_npy_path, counts.astype(np.float32))
+    save_prediction_map_png(
+        mean_png_path,
+        mean_map,
+        "Mean global prediction rendered as ROI map",
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "idx",
+            "source_path",
+            "file_path",
+            "condition",
+            "sub_condition",
+            "true_velocity",
+            "pred_velocity",
+            "mask_area_pixels",
+            "prediction_map_npy",
+            "prediction_map_png",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in manifest_rows:
+            writer.writerow(row)
+
+    return {
+        "prediction_map_dir": output_dir,
+        "mean_prediction_map_npy": mean_npy_path,
+        "mean_prediction_map_png": mean_png_path,
+        "sample_count_map_npy": count_npy_path,
+        "manifest_csv": manifest_path,
+        "num_sample_maps": len(manifest_rows),
+        "num_preview_png": min(len(manifest_rows), max_preview),
+    }
 
 
 def evaluate_generalization():
@@ -372,8 +684,8 @@ def evaluate_generalization():
     snn_input_scale_mode = "sqrt"
     batch_size = 2
     num_workers = 0
-    spatial_shape = (100, 368)
-    patch_shape = (50, 46)
+    spatial_shape = (100, 1200)
+    patch_shape = (50, 50)
     dt_us = base_dt_us
     max_velocity = 2.0
     max_eval_batches = None
@@ -381,16 +693,21 @@ def evaluate_generalization():
     event_norm_clip = (0.25, 4.0)
 
     test_data_config = {
-        "/data/zm/Moshaboli/new_data/no5": 0.01978,
+        "/data/zm/Weiliukong/6.24/withf2": 0.023138,
     }
-    mask_path = "/data/zm/Moshaboli/new_data/other_data/3.0_mask (2)_hot_pixel_mask.npy"
-    model_weights_path = "/data/zm/Moshaboli/new_data/Model/best_blood_flow_model.pth"
-    loss_curve_dir = "/data/zm/Moshaboli/new_data/Loss_curve"
-    report_dir = "/data/zm/Moshaboli/new_data/Markdown"
+    # Dataset `mask_path` is the full-frame hot-pixel mask only, shape (800, 1280).
+    # Per-source channel masks are read from data_config/checkpoint via `channel_mask_path`.
+    mask_path = "/data/zm/Weiliukong/6.17/mask/blood_maskweiliukong_hot_pixel_mask.npy"
+    model_weights_path = "/data/zm/Weiliukong/6.24/Train_result/model/best_blood_flow_model.pth"
+    loss_curve_dir = "/data/zm/Weiliukong/6.24/Train_result/evaluate/no6/Loss_curve"
+    report_dir = "/data/zm/Weiliukong/6.24/Train_result/evaluate/no6/Markdown"
     report_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     generalization_output_dir = os.path.join(loss_curve_dir, f"generalization_{report_timestamp}")
     save_plot_path = os.path.join(generalization_output_dir, "generalization_evaluate.png")
-    save_prediction_path = os.path.join(generalization_output_dir, "generalization_predictions.csv")
+    save_prediction_path = os.path.join(generalization_output_dir, "evaluate_predictions.csv")
+    save_condition_velocity_metrics_path = os.path.join(generalization_output_dir, "evaluate_condition_velocity_metrics.csv")
+    save_sub_condition_velocity_metrics_path = os.path.join(generalization_output_dir, "evaluate_sub_condition_velocity_metrics.csv")
+    prediction_map_dir = os.path.join(generalization_output_dir, "global_prediction_maps")
     report_path = os.path.join(report_dir, f"evaluate_{report_timestamp}.md")
 
     os.makedirs(generalization_output_dir, exist_ok=True)
@@ -420,21 +737,50 @@ def evaluate_generalization():
         print("WARNING: checkpoint has no usable event_norm_stats; falling back to event_norm_mode='none'.")
         event_norm_mode = "none"
 
+    has_beta_conditioning_config = isinstance(checkpoint, dict) and "beta_conditioning_config" in checkpoint
+    beta_conditioning_config = checkpoint.get("beta_conditioning_config", {}) if has_beta_conditioning_config else {}
+    use_beta_conditioning = bool(beta_conditioning_config.get("use_beta_conditioning", has_beta_conditioning_config))
+    use_bounded_scatter = bool(beta_conditioning_config.get("use_bounded_scatter", has_beta_conditioning_config))
+    scatter_scale = float(beta_conditioning_config.get("scatter_scale", 0.3))
+    if isinstance(checkpoint, dict):
+        checkpoint_data_config = checkpoint.get("data_config", {})
+        if isinstance(checkpoint_data_config, dict) and isinstance(checkpoint_data_config.get("evaluate"), dict) and checkpoint_data_config.get("evaluate"):
+            test_data_config = checkpoint_data_config["evaluate"]
+    test_data_config = merge_checkpoint_kmax_config(test_data_config, checkpoint)
+
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         checkpoint_stage = checkpoint.get("stage", "unknown")
         checkpoint_event_norm_config = checkpoint.get("event_norm_config", {})
         max_velocity = checkpoint_event_norm_config.get("max_velocity", checkpoint.get("max_velocity", max_velocity))
-        model = SNN_CNN_Hybrid(in_channels=1, max_velocity=max_velocity).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model = SNN_CNN_Hybrid(
+            in_channels=1,
+            max_velocity=max_velocity,
+            use_beta_conditioning=use_beta_conditioning,
+            use_bounded_scatter=use_bounded_scatter,
+            scatter_scale=scatter_scale,
+        ).to(device)
+        missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"WARNING: checkpoint loaded with strict=False; missing={missing}, unexpected={unexpected}")
     else:
         checkpoint_stage = "legacy_state_dict"
         checkpoint_event_norm_config = {}
-        model = SNN_CNN_Hybrid(in_channels=1, max_velocity=max_velocity).to(device)
-        model.load_state_dict(checkpoint)
+        model = SNN_CNN_Hybrid(
+            in_channels=1,
+            max_velocity=max_velocity,
+            use_beta_conditioning=use_beta_conditioning,
+            use_bounded_scatter=use_bounded_scatter,
+            scatter_scale=scatter_scale,
+        ).to(device)
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+        if missing or unexpected:
+            print(f"WARNING: legacy checkpoint loaded with strict=False; missing={missing}, unexpected={unexpected}")
     model.eval()
     print(
         f"=> Loaded checkpoint metadata | stage={checkpoint_stage}, "
-        f"event_norm_mode={event_norm_mode}, max_velocity={max_velocity}"
+        f"event_norm_mode={event_norm_mode}, max_velocity={max_velocity}, "
+        f"use_beta_conditioning={use_beta_conditioning}, use_bounded_scatter={use_bounded_scatter}, "
+        f"scatter_scale={scatter_scale}"
     )
 
     print("\n=> Loading test dataset...")
@@ -476,6 +822,21 @@ def evaluate_generalization():
     all_v_aux = []
     all_tau_pred = []
     all_log_tau = []
+    all_K_max = []
+    all_beta_max = []
+    all_gamma = []
+    all_beta_eff = []
+    all_beta_eff_ratio = []
+    all_scatter_delta = []
+    all_tau_base = []
+    all_tau_eff = []
+    all_log_tau_base = []
+    all_log_tau_eff = []
+    all_condition = []
+    all_sub_condition = []
+    all_split_group = []
+    all_quality = []
+    all_phantom_flag = []
     processed_batches = 0
 
     print(f"=> Start evaluation on {len(test_dataset)} samples...")
@@ -487,10 +848,28 @@ def evaluate_generalization():
             leave=False,
             dynamic_ncols=True,
         )
-        for batch_idx, (x_seq_sparse_data, y_true, d_values, env_maps, source_ids) in progress_bar:
+        for batch_idx, batch in progress_bar:
             if batch_idx >= effective_max_eval_batches:
                 break
+            (
+                x_seq_sparse_data,
+                y_true,
+                d_values,
+                env_maps,
+                source_ids,
+                K_max,
+                beta_max,
+                log_beta_max,
+                condition,
+                sub_condition,
+                split_group,
+                quality,
+                phantom_flag,
+                metadata,
+            ) = unpack_eval_batch(batch)
             d_values = d_values.to(device)
+            beta_max = beta_max.to(device)
+            log_beta_max = log_beta_max.to(device)
             manager = DenseBlockManager(
                 x_seq_sparse_data,
                 batch_size=y_true.shape[0],
@@ -504,6 +883,8 @@ def evaluate_generalization():
                 snn_bin_size=snn_bin_size,
                 snn_input_scale_mode=snn_input_scale_mode,
                 base_dt_us=base_dt_us,
+                beta_max=beta_max,
+                log_beta_max=log_beta_max,
             )
             v_aux = model_output["v_pred"]
             v_final = d_values / torch.clamp(model_output["tau_pred"], min=1e-8)
@@ -513,6 +894,21 @@ def evaluate_generalization():
             all_v_aux.extend(v_aux.cpu().numpy().tolist())
             all_tau_pred.extend(model_output["tau_pred"].cpu().numpy().tolist())
             all_log_tau.extend(model_output["log_tau_pred"].cpu().numpy().tolist())
+            all_K_max.extend(K_max.cpu().numpy().tolist())
+            all_beta_max.extend(model_output["beta_max"].cpu().numpy().tolist())
+            all_gamma.extend(model_output["gamma"].cpu().numpy().tolist())
+            all_beta_eff.extend(model_output["beta_eff"].cpu().numpy().tolist())
+            all_beta_eff_ratio.extend(model_output["beta_eff_ratio"].cpu().numpy().tolist())
+            all_scatter_delta.extend(model_output["scatter_delta"].cpu().numpy().tolist())
+            all_tau_base.extend(model_output["tau_base"].cpu().numpy().tolist())
+            all_tau_eff.extend(model_output["tau_eff"].cpu().numpy().tolist())
+            all_log_tau_base.extend(model_output["log_tau_base"].cpu().numpy().tolist())
+            all_log_tau_eff.extend(model_output["log_tau_eff"].cpu().numpy().tolist())
+            all_condition.extend(condition)
+            all_sub_condition.extend(sub_condition)
+            all_split_group.extend(split_group)
+            all_quality.extend(quality)
+            all_phantom_flag.extend(phantom_flag.cpu().numpy().tolist())
             processed_batches += 1
 
             progress_bar.set_postfix(
@@ -530,6 +926,17 @@ def evaluate_generalization():
     v_aux_arr = np.asarray(all_v_aux, dtype=np.float64)
     tau_arr = np.asarray(all_tau_pred, dtype=np.float64)
     log_tau_arr = np.asarray(all_log_tau, dtype=np.float64)
+    K_max_arr = np.asarray(all_K_max, dtype=np.float64)
+    beta_max_arr = np.asarray(all_beta_max, dtype=np.float64)
+    gamma_arr = np.asarray(all_gamma, dtype=np.float64)
+    beta_eff_arr = np.asarray(all_beta_eff, dtype=np.float64)
+    beta_eff_ratio_arr = np.asarray(all_beta_eff_ratio, dtype=np.float64)
+    scatter_delta_arr = np.asarray(all_scatter_delta, dtype=np.float64)
+    tau_base_arr = np.asarray(all_tau_base, dtype=np.float64)
+    tau_eff_arr = np.asarray(all_tau_eff, dtype=np.float64)
+    log_tau_base_arr = np.asarray(all_log_tau_base, dtype=np.float64)
+    log_tau_eff_arr = np.asarray(all_log_tau_eff, dtype=np.float64)
+    phantom_flag_arr = np.asarray(all_phantom_flag, dtype=np.float64)
     eval_order_metadata = eval_order_metadata[:len(v_true_arr)]
     raw_total_events_arr = np.asarray(
         [meta.get("raw_total_events", np.nan) for meta in eval_order_metadata],
@@ -543,6 +950,21 @@ def evaluate_generalization():
     sorted_v_aux = v_aux_arr[sorted_idx]
     sorted_tau = tau_arr[sorted_idx]
     sorted_log_tau = log_tau_arr[sorted_idx]
+    sorted_K_max = K_max_arr[sorted_idx]
+    sorted_beta_max = beta_max_arr[sorted_idx]
+    sorted_gamma = gamma_arr[sorted_idx]
+    sorted_beta_eff = beta_eff_arr[sorted_idx]
+    sorted_beta_eff_ratio = beta_eff_ratio_arr[sorted_idx]
+    sorted_scatter_delta = scatter_delta_arr[sorted_idx]
+    sorted_tau_base = tau_base_arr[sorted_idx]
+    sorted_tau_eff = tau_eff_arr[sorted_idx]
+    sorted_log_tau_base = log_tau_base_arr[sorted_idx]
+    sorted_log_tau_eff = log_tau_eff_arr[sorted_idx]
+    sorted_condition = [all_condition[i] for i in sorted_idx]
+    sorted_sub_condition = [all_sub_condition[i] for i in sorted_idx]
+    sorted_split_group = [all_split_group[i] for i in sorted_idx]
+    sorted_quality = [all_quality[i] for i in sorted_idx]
+    sorted_phantom_flag = phantom_flag_arr[sorted_idx]
     sorted_metadata = [eval_order_metadata[i] for i in sorted_idx]
     sorted_raw_total_events = raw_total_events_arr[sorted_idx]
 
@@ -582,6 +1004,13 @@ def evaluate_generalization():
         "tau_sample_max": float(sorted_tau.max()) if sorted_tau.size else float("nan"),
         "log_tau_min": float(sorted_log_tau.min()) if sorted_log_tau.size else float("nan"),
         "log_tau_max": float(sorted_log_tau.max()) if sorted_log_tau.size else float("nan"),
+        "gamma_mean": float(sorted_gamma.mean()) if sorted_gamma.size else float("nan"),
+        "gamma_std": float(sorted_gamma.std()) if sorted_gamma.size else float("nan"),
+        "beta_eff_ratio_mean": float(sorted_beta_eff_ratio.mean()) if sorted_beta_eff_ratio.size else float("nan"),
+        "scatter_delta_mean": float(sorted_scatter_delta.mean()) if sorted_scatter_delta.size else float("nan"),
+        "corr_gamma_velocity": safe_pearson(sorted_gamma, sorted_v_true),
+        "corr_scatter_delta_velocity": safe_pearson(sorted_scatter_delta, sorted_v_true),
+        "beta_eff_lt_beta_max": bool(sorted_beta_eff.size > 0 and np.all(sorted_beta_eff < sorted_beta_max + 1e-12)),
         "correlations": correlations,
         "mae_by_velocity": mae_by_velocity,
     }
@@ -612,6 +1041,21 @@ def evaluate_generalization():
                 "aux_velocity_mm_per_s",
                 "tau_sample_s",
                 "log_tau",
+                "K_max",
+                "beta_max",
+                "gamma",
+                "beta_eff",
+                "beta_eff_ratio",
+                "scatter_delta",
+                "tau_base",
+                "tau_eff",
+                "log_tau_base",
+                "log_tau_eff",
+                "condition",
+                "sub_condition",
+                "split_group",
+                "quality",
+                "phantom_flag",
                 "abs_error_mm_per_s",
                 "clipped_abs_error_mm_per_s",
                 "rel_error_pct",
@@ -633,6 +1077,21 @@ def evaluate_generalization():
                     sorted_v_aux[row_idx],
                     sorted_tau[row_idx],
                     sorted_log_tau[row_idx],
+                    sorted_K_max[row_idx],
+                    sorted_beta_max[row_idx],
+                    sorted_gamma[row_idx],
+                    sorted_beta_eff[row_idx],
+                    sorted_beta_eff_ratio[row_idx],
+                    sorted_scatter_delta[row_idx],
+                    sorted_tau_base[row_idx],
+                    sorted_tau_eff[row_idx],
+                    sorted_log_tau_base[row_idx],
+                    sorted_log_tau_eff[row_idx],
+                    sorted_condition[row_idx],
+                    sorted_sub_condition[row_idx],
+                    sorted_split_group[row_idx],
+                    sorted_quality[row_idx],
+                    sorted_phantom_flag[row_idx],
                     abs_err[row_idx],
                     clipped_abs_err[row_idx],
                     rel_err_pct[row_idx],
@@ -643,6 +1102,57 @@ def evaluate_generalization():
                     meta.get("file_path", ""),
                 ]
             )
+
+    prediction_records = build_prediction_records(
+        {
+            "epoch_idx": checkpoint.get("epoch", float("nan")) if isinstance(checkpoint, dict) else float("nan"),
+            "split_name": "Evaluate",
+            "v_true": sorted_v_true.tolist(),
+            "v_pred": sorted_v_pred.tolist(),
+            "v_aux": sorted_v_aux.tolist(),
+            "d_values": [meta.get("d_val", np.nan) for meta in sorted_metadata],
+            "tau_pred_values": sorted_tau.tolist(),
+            "log_tau_values": sorted_log_tau.tolist(),
+            "K_max_values": sorted_K_max.tolist(),
+            "beta_max_values": sorted_beta_max.tolist(),
+            "beta_eff_values": sorted_beta_eff.tolist(),
+            "beta_eff_ratio_values": sorted_beta_eff_ratio.tolist(),
+            "gamma_values": sorted_gamma.tolist(),
+            "scatter_delta_values": sorted_scatter_delta.tolist(),
+            "tau_base_values": sorted_tau_base.tolist(),
+            "tau_eff_values": sorted_tau_eff.tolist(),
+            "log_tau_base_values": sorted_log_tau_base.tolist(),
+            "log_tau_eff_values": sorted_log_tau_eff.tolist(),
+            "condition_values": sorted_condition,
+            "sub_condition_values": sorted_sub_condition,
+            "split_group_values": sorted_split_group,
+            "quality_values": sorted_quality,
+            "phantom_flag_values": sorted_phantom_flag.tolist(),
+            "metadata": sorted_metadata,
+        }
+    )
+    save_condition_velocity_metrics_csv(
+        save_condition_velocity_metrics_path,
+        compute_condition_velocity_metrics(prediction_records),
+    )
+    save_sub_condition_velocity_metrics_csv(
+        save_sub_condition_velocity_metrics_path,
+        compute_sub_condition_velocity_metrics(prediction_records),
+    )
+
+    prediction_map_outputs = {}
+    if SAVE_GLOBAL_PREDICTION_MAPS:
+        prediction_map_outputs = save_global_prediction_maps(
+            prediction_map_dir,
+            test_dataset,
+            sorted_metadata,
+            sorted_v_pred,
+            sorted_v_true,
+            sorted_condition,
+            sorted_sub_condition,
+            spatial_shape,
+            max_preview=MAX_PREDICTION_MAP_PREVIEWS,
+        )
 
     plt.figure(figsize=(12, 6))
     plt.plot(range(len(sorted_v_true)), sorted_v_true, label="True velocity", color="black", linewidth=2)
@@ -669,6 +1179,7 @@ def evaluate_generalization():
             "generalization_output_dir": generalization_output_dir,
             "save_plot_path": save_plot_path,
             "save_prediction_path": save_prediction_path,
+            "prediction_map_outputs": prediction_map_outputs,
             "window_ms": window_ms,
             "base_dt_us": base_dt_us,
             "base_total_steps": base_total_steps,
@@ -682,6 +1193,9 @@ def evaluate_generalization():
             "spatial_shape": spatial_shape,
             "patch_shape": patch_shape,
             "max_velocity": max_velocity,
+            "use_beta_conditioning": use_beta_conditioning,
+            "use_bounded_scatter": use_bounded_scatter,
+            "scatter_scale": scatter_scale,
             "max_eval_batches": max_eval_batches,
             "eval_sampling_plan": eval_sampling_plan,
             "eval_batches": len(test_loader),
@@ -691,6 +1205,9 @@ def evaluate_generalization():
     )
     print(f"=> Saved predictions to: {save_prediction_path}")
     print(f"=> Saved plot to: {save_plot_path}")
+    if prediction_map_outputs:
+        print(f"=> Saved mean prediction map to: {prediction_map_outputs.get('mean_prediction_map_png')}")
+        print(f"=> Saved prediction map manifest to: {prediction_map_outputs.get('manifest_csv')}")
     print(f"=> Saved evaluation report to: {report_path}")
 
 
