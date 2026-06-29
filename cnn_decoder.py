@@ -34,12 +34,20 @@ class SNNFeatureCNNDecoder(nn.Module):
         init_velocity=1.1,
         log_tau_center=-4.0,
         log_tau_scale=2.0,
+        use_beta_conditioning=False,
+        use_bounded_scatter=False,
+        scatter_scale=0.3,
+        beta_eps=1e-8,
     ):
         super().__init__()
         c1, c2, c3 = in_channels
         self.max_velocity = float(max_velocity)
         self.log_tau_center = float(log_tau_center)
         self.log_tau_scale = float(log_tau_scale)
+        self.use_beta_conditioning = bool(use_beta_conditioning)
+        self.use_bounded_scatter = bool(use_bounded_scatter)
+        self.scatter_scale = float(scatter_scale)
+        self.beta_eps = float(beta_eps)
 
         self.project3 = nn.Sequential(
             nn.Conv2d(c3, 128, kernel_size=1, bias=False),
@@ -69,6 +77,28 @@ class SNNFeatureCNNDecoder(nn.Module):
         )
         self.velocity_head = nn.Linear(embedding_dim, 1)
         self.log_tau_head = nn.Linear(embedding_dim, 1)
+        self.calibration_encoder = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 32),
+            nn.ReLU(inplace=True),
+        )
+        fused_dim = embedding_dim + 32
+        self.beta_tau_head = nn.Sequential(
+            nn.Linear(fused_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+        self.scatter_gamma_head = nn.Sequential(
+            nn.Linear(fused_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+        self.scatter_delta_head = nn.Sequential(
+            nn.Linear(fused_dim + 1, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
         self._init_velocity_bias(init_velocity)
 
     def _init_velocity_bias(self, init_velocity):
@@ -77,7 +107,7 @@ class SNNFeatureCNNDecoder(nn.Module):
         nn.init.normal_(self.velocity_head.weight, mean=0.0, std=1e-3)
         nn.init.constant_(self.velocity_head.bias, bias)
 
-    def forward(self, features, patches_per_sample):
+    def forward(self, features, patches_per_sample, log_beta_max=None, beta_max=None):
         feat_1, feat_2, feat_3 = features
 
         x3 = self.block3(self.project3(feat_3))
@@ -104,18 +134,68 @@ class SNNFeatureCNNDecoder(nn.Module):
         )
 
         cnn_embedding = self.embedding(sample_embedding)
+        if log_beta_max is None:
+            log_beta_max = cnn_embedding.new_zeros(batch_size)
+        else:
+            log_beta_max = log_beta_max.to(device=cnn_embedding.device, dtype=cnn_embedding.dtype).view(-1)
+        if beta_max is None:
+            beta_max = cnn_embedding.new_ones(batch_size)
+        else:
+            beta_max = beta_max.to(device=cnn_embedding.device, dtype=cnn_embedding.dtype).view(-1)
+        if log_beta_max.shape[0] != batch_size:
+            raise ValueError(f"log_beta_max shape {tuple(log_beta_max.shape)} does not match batch_size={batch_size}.")
+        if beta_max.shape[0] != batch_size:
+            raise ValueError(f"beta_max shape {tuple(beta_max.shape)} does not match batch_size={batch_size}.")
+        beta_max = torch.clamp(beta_max, min=self.beta_eps)
+
+        calib_input = log_beta_max.unsqueeze(-1) if self.use_beta_conditioning else cnn_embedding.new_zeros(batch_size, 1)
+        calib_embedding = self.calibration_encoder(calib_input)
+        fused_embedding = torch.cat((cnn_embedding, calib_embedding), dim=-1)
+
         v_pred_raw = self.velocity_head(cnn_embedding).view(-1)
         v_pred = self.max_velocity * torch.sigmoid(v_pred_raw)
-        log_tau_delta = self.log_tau_head(cnn_embedding).view(-1)
-        log_tau_pred = self.log_tau_center + self.log_tau_scale * torch.tanh(log_tau_delta)
-        tau_pred = torch.exp(log_tau_pred)
+        if self.use_beta_conditioning:
+            log_tau_delta = self.beta_tau_head(fused_embedding).view(-1)
+        else:
+            log_tau_delta = self.log_tau_head(cnn_embedding).view(-1)
+        log_tau_base = self.log_tau_center + self.log_tau_scale * torch.tanh(log_tau_delta)
+        tau_base = torch.exp(log_tau_base)
+
+        if self.use_bounded_scatter:
+            raw_gamma = self.scatter_gamma_head(fused_embedding).view(-1)
+            gamma = torch.sigmoid(raw_gamma).clamp(min=self.beta_eps, max=1.0 - self.beta_eps)
+            beta_eff = gamma * beta_max
+            scatter_input = torch.cat((fused_embedding, gamma.unsqueeze(-1)), dim=-1)
+            scatter_delta_raw = self.scatter_delta_head(scatter_input).view(-1)
+            scatter_delta = self.scatter_scale * torch.tanh(scatter_delta_raw)
+        else:
+            raw_gamma = cnn_embedding.new_zeros(batch_size)
+            gamma = torch.sigmoid(raw_gamma).clamp(min=self.beta_eps, max=1.0 - self.beta_eps)
+            beta_eff = gamma * beta_max
+            scatter_delta = cnn_embedding.new_zeros(batch_size)
+
+        beta_eff_ratio = beta_eff / (beta_max + self.beta_eps)
+        log_tau_eff = log_tau_base + scatter_delta
+        tau_eff = torch.exp(log_tau_eff)
 
         return {
             "v_pred": v_pred,
             "v_pred_raw": v_pred_raw,
-            "log_tau_pred": log_tau_pred,
+            "log_tau_pred": log_tau_eff,
             "log_tau_delta": log_tau_delta,
-            "tau_pred": tau_pred,
+            "tau_pred": tau_eff,
             "cnn_embedding": cnn_embedding,
+            "calib_embedding": calib_embedding,
+            "fused_embedding": fused_embedding,
             "fused_map": fused_map,
+            "log_tau_base": log_tau_base,
+            "tau_base": tau_base,
+            "raw_gamma": raw_gamma,
+            "gamma": gamma,
+            "beta_max": beta_max,
+            "beta_eff": beta_eff,
+            "beta_eff_ratio": beta_eff_ratio,
+            "scatter_delta": scatter_delta,
+            "log_tau_eff": log_tau_eff,
+            "tau_eff": tau_eff,
         }
